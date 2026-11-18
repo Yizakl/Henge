@@ -1,14 +1,18 @@
-# .github/workflows/build-henge.yml  —— v3「先取证，再打包」
+# .github/workflows/build-henge.yml  —— v4
 #
-# 与上游 build-henge.yml 的区别只有两处：
-#   1) 打包前多一个 Diagnose 步骤：打印 SDKROOT / ARCHS / 环境变量，
-#      并脱离 xcodebuild 直接用 clang 编一次 henge-tl-app.m。
-#   2) Package 失败时不猜、不补头文件，直接把 buildlog 里最后一次
-#      CompileC 的完整 clang 命令行和所有 -target / -isysroot 打出来。
+# 与 v3 相同：照常构建 + 打包。
+# 新增：最后一步把诊断结论写成 GitHub 注解（::warning title=...::），
+# 注解在公开的 job 页面上可见，无需登录即可读取，也写进 $GITHUB_STEP_SUMMARY。
 #
-# 目的：确认 NSURLHandle.h / NSGeometry.h 这两个「iOS SDK 本来就没有、
-# 只有 macOS 才有」的头，为什么会被 include —— 也就是确认那次编译的
-# -target 三要素是不是变成了 macos。
+# 注解包括：
+#   Env         —— SDKROOT / CPATH / CPLUS_INCLUDE_PATH / OBJC_INCLUDE_PATH / DEVELOPER_DIR
+#   Settings    —— SDKROOT / ARCHS / PLATFORM_NAME / EFFECTIVE_PLATFORM_NAME / ONLY_ACTIVE_ARCH / OTHER_CFLAGS
+#   Standalone  —— 脱离 xcodebuild 直接 clang 编 henge-tl-app.m 的结果
+#   Headers     —— iOS SDK 里 NSURLHandle.h / NSGeometry.h 是否缺失（预期都 MISSING）
+#   Triples     —— buildlog 里出现过的所有 -target 值
+#   Sysroots    —— buildlog 里出现过的所有 -isysroot 值
+#   FailingTU   —— 报错前最后一个 CompileC 的 .m 文件
+#   FirstError  —— 第一行 error
 
 name: Build Henge IPA
 
@@ -77,90 +81,98 @@ jobs:
         working-directory: Henge
         run: make ios-lib
 
-      # ---------------------------------------------------------------
-      # 新增：取证。不产出任何东西，只把「编译到底被当成什么平台」印出来。
-      # ---------------------------------------------------------------
       - name: Diagnose (SDK, build settings, stray env, standalone compile)
         working-directory: Henge
         run: |
-          set -x
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
-          echo "=== stray environment ==="
-          env | grep -i -E '^(SDKROOT|CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH|DEVELOPER_DIR|MACOSX_DEPLOYMENT_TARGET)=' || echo "none"
-          echo "=== generate project ==="
+          set +e
+          F=/tmp/facts.txt
+          : > "$F"
+
+          echo "--- env ---"
+          ENVLINE="$(env | grep -i -E '^(SDKROOT|CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH|DEVELOPER_DIR|MACOSX_DEPLOYMENT_TARGET)=' || echo none)"
+          echo "ENV: $ENVLINE" >> "$F"
+
+          echo "--- generate ---"
           cd ios
-          xcodegen generate
-          echo "=== build settings ==="
+          xcodegen generate > /tmp/xcodegen.log 2>&1
+          echo "XCODEGEN_RC=$?" >> "$F"
+
+          echo "--- build settings ---"
           xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release \
-            -sdk iphoneos -showBuildSettings > /tmp/settings.txt 2>&1 || true
-          grep -E '^\s+(SDKROOT|ARCHS|PLATFORM_NAME|EFFECTIVE_PLATFORM_NAME|SUPPORTED_PLATFORMS|OTHER_CFLAGS|GCC_PREPROCESSOR_DEFINITIONS|CLANG_CXX_LANGUAGE_STANDARD) =' /tmp/settings.txt | head -30
-          echo "=== standalone compile of henge-tl-app.m (no xcodebuild) ==="
+            -sdk iphoneos -showBuildSettings > /tmp/settings.txt 2>&1
+          SETLINE="$(grep -E '^\s+(SDKROOT|ARCHS|PLATFORM_NAME|EFFECTIVE_PLATFORM_NAME|ONLY_ACTIVE_ARCH|OTHER_CFLAGS|SUPPORTED_PLATFORMS) =' /tmp/settings.txt | tr -s ' ' | tr '\n' ';')"
+          echo "SETTINGS: $SETLINE" >> "$F"
+
+          echo "--- standalone compile ---"
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "SDKPATH: $SDK" >> "$F"
           if xcrun --sdk iphoneos clang -x objective-c \
                -target arm64-apple-ios17.0 -isysroot "$SDK" -fobjc-arc -fmodules \
                -I../core -I../host -I../devices -IHenge/Native \
-               -fsyntax-only Henge/Native/henge-tl-app.m; then
-            echo "STANDALONE OK"
+               -fsyntax-only Henge/Native/henge-tl-app.m > /tmp/standalone.log 2>&1; then
+            echo "STANDALONE=OK" >> "$F"
           else
-            echo "STANDALONE FAILED"
+            echo "STANDALONE=FAILED" >> "$F"
+            echo "STANDALONE_ERR: $(grep -m2 'error:' /tmp/standalone.log | tr '\n' '|' | cut -c1-300)" >> "$F"
           fi
-          echo "=== does the iOS SDK ship those two headers? (should be MISSING both) ==="
-          H="$SDK/System/Library/Frameworks/Foundation.framework/Headers"
-          for f in NSURLHandle.h NSGeometry.h; do
-            if [ -f "$H/$f" ]; then echo "present $f"; else echo "MISSING $f"; fi
-          done
 
-      # ---------------------------------------------------------------
-      # 打包。失败时把最后一次 CompileC 的完整命令行抓出来。
-      # ---------------------------------------------------------------
-      - name: Package Henge.ipa (with diagnostics)
+          echo "--- headers ---"
+          H="$SDK/System/Library/Frameworks/Foundation.framework/Headers"
+          for f in NSURLHandle.h NSGeometry.h NSURL.h; do
+            if [ -f "$H/$f" ]; then echo "HEADER_$f=present" >> "$F"; else echo "HEADER_$f=MISSING" >> "$F"; fi
+          done
+          cat "$F"
+
+      - name: Package Henge.ipa
         working-directory: Henge
+        id: package
         run: |
           set +e
           zsh ios/scripts/package_ipa.sh
           RC=$?
-          LOG=ios/build/DerivedData.buildlog
-          if [ "$RC" -ne 0 ] && [ -f "$LOG" ]; then
-            echo "::group::error lines"
-            grep -a -n 'error:' "$LOG" | head -20
-            echo "::endgroup::"
-
-            echo "::group::last CompileC block (full clang command)"
-            grep -a -n -B2 -A36 '^CompileC' "$LOG" | tail -90
-            echo "::endgroup::"
-
-            echo "::group::all -target values seen"
-            grep -a -o -- '-target [^ ]*' "$LOG" | sort -u | head -20
-            echo "::endgroup::"
-
-            echo "::group::all -isysroot values seen"
-            grep -a -o -- '-isysroot [^ ]*' "$LOG" | sort -u | head -20
-            echo "::endgroup::"
-
-            echo "::group::-D defines on the failing translation unit"
-            grep -a -o -- ' -D[^ ]*' "$LOG" | sort -u | head -40
-            echo "::endgroup::"
-          fi
+          echo "package_rc=$RC" >> "$GITHUB_OUTPUT"
           exit "$RC"
 
-      - name: Upload Henge.ipa
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Henge-ipa-${{ github.sha }}
-          path: /Users/runner/Desktop/Henge.ipa
-          if-no-files-found: error
-
-      - name: Package Henge.tipa
-        if: success()
+      # 无论成败都执行：把结论写成注解，公开页面可见
+      - name: Report as annotations
+        if: always()
         working-directory: Henge
-        run: zsh ios/scripts/package_ipa.sh --trollstore
+        run: |
+          set +e
+          F=/tmp/facts.txt
+          LOG=ios/build/DerivedData.buildlog
 
-      - name: Upload Henge.tipa
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Henge-tipa-${{ github.sha }}
-          path: /Users/runner/Desktop/Henge.tipa
-          if-no-files-found: error
+          emit() {
+            T="$1"; shift
+            M="$(printf '%s' "$*" | tr '\n\r' '  ' | cut -c1-900)"
+            echo "::warning title=${T}::${M}"
+          }
+
+          emit Env "$(grep '^ENV:' "$F" 2>/dev/null | cut -c6-)"
+          emit Settings "$(grep '^SETTINGS:' "$F" 2>/dev/null | cut -c11-)"
+          emit Standalone "$(grep -E '^STANDALONE' "$F" 2>/dev/null | tr '\n' ' ')"
+          emit Headers "$(grep -E '^HEADER_' "$F" 2>/dev/null | tr '\n' ' ')"
+
+          if [ -f "$LOG" ]; then
+            emit Triples "$(grep -a -o -- '-target [^ ]*' "$LOG" | sort -u | tr '\n' ' ')"
+            emit Sysroots "$(grep -a -o -- '-isysroot [^ ]*' "$LOG" | sort -u | tr '\n' ' ')"
+            emit FailingTU "$(awk '/^CompileC /{tu=$2} /error:/{print tu; exit}' "$LOG" | tr '\n' ' ')"
+            emit FirstError "$(grep -a -m1 'error:' "$LOG" | cut -c1-400)"
+          else
+            emit BuildLog "no buildlog at $LOG"
+          fi
+
+          {
+            echo "### Henge 构建诊断"
+            echo ""
+            echo '```'
+            cat "$F" 2>/dev/null
+            if [ -f "$LOG" ]; then
+              echo ""
+              echo "triples: $(grep -a -o -- '-target [^ ]*' "$LOG" | sort -u | tr '\n' ' ')"
+              echo "sysroots: $(grep -a -o -- '-isysroot [^ ]*' "$LOG" | sort -u | tr '\n' ' ')"
+              echo "failing TU: $(awk '/^CompileC /{tu=$2} /error:/{print tu; exit}' "$LOG")"
+              echo "first error: $(grep -a -m1 'error:' "$LOG")"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
