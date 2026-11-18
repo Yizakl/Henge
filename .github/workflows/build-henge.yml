@@ -1,48 +1,166 @@
-# .github/workflows/probe-sdk.yml
+# .github/workflows/build-henge.yml  —— v3「先取证，再打包」
 #
-# 只做诊断，不编译 Henge，约 40 秒跑完。
-# 目的：确认 iPhoneOS SDK 的 Foundation 头目录是否完整，
-# 以及一个最小的 ObjC 文件能否在该 SDK 下编译通过。
+# 与上游 build-henge.yml 的区别只有两处：
+#   1) 打包前多一个 Diagnose 步骤：打印 SDKROOT / ARCHS / 环境变量，
+#      并脱离 xcodebuild 直接用 clang 编一次 henge-tl-app.m。
+#   2) Package 失败时不猜、不补头文件，直接把 buildlog 里最后一次
+#      CompileC 的完整 clang 命令行和所有 -target / -isysroot 打出来。
+#
+# 目的：确认 NSURLHandle.h / NSGeometry.h 这两个「iOS SDK 本来就没有、
+# 只有 macOS 才有」的头，为什么会被 include —— 也就是确认那次编译的
+# -target 三要素是不是变成了 macos。
 
-name: Probe iOS SDK
+name: Build Henge IPA
 
 on:
   workflow_dispatch: {}
 
+env:
+  HUSK: ${{ github.workspace }}/Husk
+  IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
+
 jobs:
-  probe:
+  build:
     runs-on: xcode-27
-    timeout-minutes: 10
+    timeout-minutes: 120
 
     steps:
-      - name: Inventory and smoke test
+      - name: Check out Henge (this fork)
+        uses: actions/checkout@v4
+        with:
+          path: Henge
+
+      - name: Check out Husk
+        uses: actions/checkout@v4
+        with:
+          repository: Leviidev/Husk
+          path: Husk
+
+      - name: Cache Husk's sources and prebuilt iOS pieces
+        uses: actions/cache@v4
+        with:
+          path: |
+            Husk/third_party/build
+            Husk/build
+          key: husk-ios-arm64-${{ hashFiles('Husk/scripts/build_ios.sh', 'Husk/scripts/fetch_sources.sh') }}
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          brew install xcodegen meson ninja pkg-config
+          rustup target add aarch64-apple-ios || {
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            rustup target add aarch64-apple-ios
+          }
+
+      - name: Fetch Husk's third-party sources
+        working-directory: Husk
+        run: bash scripts/fetch_sources.sh
+
+      - name: Build the iOS libraries Henge needs
+        working-directory: Husk
+        run: bash scripts/build_ios.sh libffi glib libslirp
+
+      - name: Build Husk's on-device pairing library
+        working-directory: Husk
+        run: bash scripts/build_rppairing_ios.sh
+
+      - name: Copy prebuilt deps into Henge
+        working-directory: Henge
+        run: zsh ios/scripts/fetch_deps.sh
+
+      - name: Build the restore stack (libirecovery, usbmuxd, idevicerestore)
+        working-directory: Henge
+        run: zsh tools/build_ios_restore.sh
+
+      - name: Build the engine
+        working-directory: Henge
+        run: make ios-lib
+
+      # ---------------------------------------------------------------
+      # 新增：取证。不产出任何东西，只把「编译到底被当成什么平台」印出来。
+      # ---------------------------------------------------------------
+      - name: Diagnose (SDK, build settings, stray env, standalone compile)
+        working-directory: Henge
         run: |
           set -x
-          ls -d /Applications/Xcode*.app || true
-          for x in /Applications/Xcode*.app; do
-            echo "== $x"
-            "$x/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | head -2 || true
-            ls -d "$x/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/"*.sdk 2>/dev/null || true
-          done
-          echo "== active"; xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"; echo "SDK=$SDK"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          echo "=== stray environment ==="
+          env | grep -i -E '^(SDKROOT|CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH|DEVELOPER_DIR|MACOSX_DEPLOYMENT_TARGET)=' || echo "none"
+          echo "=== generate project ==="
+          cd ios
+          xcodegen generate
+          echo "=== build settings ==="
+          xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release \
+            -sdk iphoneos -showBuildSettings > /tmp/settings.txt 2>&1 || true
+          grep -E '^\s+(SDKROOT|ARCHS|PLATFORM_NAME|EFFECTIVE_PLATFORM_NAME|SUPPORTED_PLATFORMS|OTHER_CFLAGS|GCC_PREPROCESSOR_DEFINITIONS|CLANG_CXX_LANGUAGE_STANDARD) =' /tmp/settings.txt | head -30
+          echo "=== standalone compile of henge-tl-app.m (no xcodebuild) ==="
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          if xcrun --sdk iphoneos clang -x objective-c \
+               -target arm64-apple-ios17.0 -isysroot "$SDK" -fobjc-arc -fmodules \
+               -I../core -I../host -I../devices -IHenge/Native \
+               -fsyntax-only Henge/Native/henge-tl-app.m; then
+            echo "STANDALONE OK"
+          else
+            echo "STANDALONE FAILED"
+          fi
+          echo "=== does the iOS SDK ship those two headers? (should be MISSING both) ==="
           H="$SDK/System/Library/Frameworks/Foundation.framework/Headers"
-          echo "headers in Foundation: $(ls "$H" 2>/dev/null | wc -l)"
-          for f in NSURL.h NSGeometry.h NSURLHandle.h NSKeyedArchiver.h NSObject.h NSObjCRuntime.h NSValue.h; do
+          for f in NSURLHandle.h NSGeometry.h; do
             if [ -f "$H/$f" ]; then echo "present $f"; else echo "MISSING $f"; fi
           done
-          echo "== first 40 headers"; ls "$H" 2>/dev/null | head -40
-          echo "== header maps?"; ls "$SDK/usr/lib" 2>/dev/null | head -5
-          echo "== smoke test: minimal ObjC file including Foundation, for iOS arm64"
-          printf '#import <Foundation/Foundation.h>\nint main(void){ return 0; }\n' > /tmp/t.m
-          if xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -fobjc-arc -c /tmp/t.m -o /tmp/t.o; then
-            echo "SMOKE OK"
-          else
-            echo "SMOKE FAILED"
+
+      # ---------------------------------------------------------------
+      # 打包。失败时把最后一次 CompileC 的完整命令行抓出来。
+      # ---------------------------------------------------------------
+      - name: Package Henge.ipa (with diagnostics)
+        working-directory: Henge
+        run: |
+          set +e
+          zsh ios/scripts/package_ipa.sh
+          RC=$?
+          LOG=ios/build/DerivedData.buildlog
+          if [ "$RC" -ne 0 ] && [ -f "$LOG" ]; then
+            echo "::group::error lines"
+            grep -a -n 'error:' "$LOG" | head -20
+            echo "::endgroup::"
+
+            echo "::group::last CompileC block (full clang command)"
+            grep -a -n -B2 -A36 '^CompileC' "$LOG" | tail -90
+            echo "::endgroup::"
+
+            echo "::group::all -target values seen"
+            grep -a -o -- '-target [^ ]*' "$LOG" | sort -u | head -20
+            echo "::endgroup::"
+
+            echo "::group::all -isysroot values seen"
+            grep -a -o -- '-isysroot [^ ]*' "$LOG" | sort -u | head -20
+            echo "::endgroup::"
+
+            echo "::group::-D defines on the failing translation unit"
+            grep -a -o -- ' -D[^ ]*' "$LOG" | sort -u | head -40
+            echo "::endgroup::"
           fi
-          echo "== same file, with modules forced off"
-          if xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -fobjc-arc -fno-modules -c /tmp/t.m -o /tmp/t2.o; then
-            echo "SMOKE2 OK"
-          else
-            echo "SMOKE2 FAILED"
-          fi
+          exit "$RC"
+
+      - name: Upload Henge.ipa
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-ipa-${{ github.sha }}
+          path: /Users/runner/Desktop/Henge.ipa
+          if-no-files-found: error
+
+      - name: Package Henge.tipa
+        if: success()
+        working-directory: Henge
+        run: zsh ios/scripts/package_ipa.sh --trollstore
+
+      - name: Upload Henge.tipa
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-tipa-${{ github.sha }}
+          path: /Users/runner/Desktop/Henge.tipa
+          if-no-files-found: error
