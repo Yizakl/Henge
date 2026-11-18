@@ -1,34 +1,29 @@
 # .github/workflows/build-henge.yml
 #
-# Builds a Henge.ipa from your fork's main branch on a GitHub-hosted macOS
-# runner, no Mac needed. Free on a PUBLIC repo: public repos get unlimited
-# minutes on hosted runners, including macOS. On a private repo, macOS minutes
-# bill at 10x, so the free tier's ~2000 min/month is only ~200 macOS minutes.
+# Builds an unsigned Henge.ipa from your fork's main on a GitHub-hosted macOS
+# runner, no Mac needed. Public repos get free minutes, macOS included.
 #
-# The IPA comes out unsigned with ad-hoc signing (package_ipa.sh's normal
-# output). SideStore/AltStore re-signs it with your certificate on install
-# and keeps the entitlements it can; increased-memory-limit only survives if
-# your certificate carries it, and Henge falls back to file-backed guest RAM
-# without it.
+# Changes from upstream's file (Leviidev/Henge):
+#   * prefers Xcode 27.0 when the image still has it: iPhoneOS 27.1's SDK ships a
+#     Foundation/NSURL.h that pulls in the macOS-only Foundation/NSURLHandle.h and
+#     breaks every Objective-C file that includes Foundation.
+#   * falls back to stubbing that one header inside the SDK (build machine only,
+#     never part of the app) when 27.0 is gone.
+#   * scrubs CPATH / C_INCLUDE_PATH / CPLUS_INCLUDE_PATH / OBJC_INCLUDE_PATH /
+#     SDKROOT before xcodebuild: a stray macOS include path makes the iOS SDK pick
+#     macOS conditionals, which is the other way this same error shows up.
 
 name: Build Henge IPA
 
-# Manual only (Actions tab > Build Henge IPA > Run workflow): pushes to main don't build an IPA.
 on:
   workflow_dispatch: {}
 
 env:
   HUSK: ${{ github.workspace }}/Husk
-  # The Makefile takes its slirp headers from IOS_DEPS, not HUSK:
-  #   IOS_DEPS ?= $(HOME)/Documents/Coding/Husk/build/ios-arm64/sysroot
-  # (HUSK is only read by ios/scripts/fetch_deps.sh.)
   IOS_DEPS: ${{ github.workspace }}/Husk/build/ios-arm64/sysroot
 
 jobs:
   build:
-    # Xcode 27 image (arm64, GA since Oct 2026). Plain `xcode-27` is a standard
-    # runner, so it's free on public repos; `xcode-27-xlarge` is a paid larger
-    # runner. Table: https://github.com/actions/runner-images#available-images
     runs-on: xcode-27
     timeout-minutes: 120
 
@@ -38,10 +33,6 @@ jobs:
         with:
           path: Henge
 
-      # fetch_deps.sh copies prebuilt pieces out of a BUILT Husk checkout:
-      # StikJIT.xcframework (vendored in Husk's repo, comes with checkout),
-      # libhusk_rppairing.a (scripts/build_rppairing_ios.sh) and the
-      # libslirp/glib/intl/pcre2 static libs (scripts/build_ios.sh).
       - name: Check out Husk
         uses: actions/checkout@v4
         with:
@@ -60,23 +51,30 @@ jobs:
         run: |
           set -euxo pipefail
           brew install xcodegen meson ninja pkg-config
-          # Runner images ship rustup; add the iOS target if it's missing.
           rustup target add aarch64-apple-ios || {
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             rustup target add aarch64-apple-ios
           }
 
-      # build_ios.sh builds from third_party/build/<name>; the sources are
-      # fetched by fetch_sources.sh, which Husk's own ci_build.sh runs first.
+      - name: Pick Xcode 27.0 when the image still has it
+        run: |
+          set -x
+          ls -d /Applications/Xcode*.app || true
+          for app in /Applications/Xcode_27.0*.app /Applications/Xcode_27.app; do
+            if [ -d "$app" ]; then
+              sudo xcode-select -s "$app"
+              echo "SELECTED=$app" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          env | grep -iE '^(CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH|SDKROOT)=' || echo "no include-path env set"
+
       - name: Fetch Husk's third-party sources
         working-directory: Husk
         run: bash scripts/fetch_sources.sh
 
-      # Henge only needs these three sysroot pieces: libffi (a glib dep),
-      # glib (whose meson subprojects also produce libpcre2-8 and libintl),
-      # and libslirp (the guest network). Skip Husk's pixman/libucontext/qemu
-      # stages entirely: that's the Android emulator, minutes instead of an
-      # hour-plus.
       - name: Build the iOS libraries Henge needs
         working-directory: Husk
         run: bash scripts/build_ios.sh libffi glib libslirp
@@ -97,9 +95,30 @@ jobs:
         working-directory: Henge
         run: make ios-lib
 
-      - name: Package Henge.ipa
+      - name: Package Henge.ipa (with SDK-header fallback)
         working-directory: Henge
-        run: zsh ios/scripts/package_ipa.sh
+        run: |
+          set -u
+          pkg() {
+            env -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH \
+                -u OBJC_INCLUDE_PATH -u SDKROOT \
+                zsh ios/scripts/package_ipa.sh
+          }
+
+          if pkg; then exit 0; fi
+
+          LOG=ios/build/DerivedData.buildlog
+          if grep -q "NSURLHandle.h' file not found" "$LOG" 2>/dev/null; then
+            SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+            HDR="$SDK/System/Library/Frameworks/Foundation.framework/Headers/NSURLHandle.h"
+            echo "==> iPhoneOS $(xcrun --sdk iphoneos --show-sdk-version) SDK wants the macOS-only NSURLHandle.h; stubbing it at $HDR"
+            sudo sh -c "printf '#import <Foundation/NSObject.h>\n' > \"$HDR\""
+            rm -rf ios/build/DerivedData
+            pkg
+          else
+            echo "==> not the NSURLHandle error; nothing stubbed, failing as upstream does"
+            exit 1
+          fi
 
       - name: Upload Henge.ipa
         uses: actions/upload-artifact@v4
@@ -110,7 +129,7 @@ jobs:
 
       - name: Package Henge.tipa
         working-directory: Henge
-        run: zsh ios/scripts/package_ipa.sh --trollstore
+        run: env -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u OBJC_INCLUDE_PATH -u SDKROOT zsh ios/scripts/package_ipa.sh --trollstore
 
       - name: Upload Henge.tipa
         uses: actions/upload-artifact@v4
